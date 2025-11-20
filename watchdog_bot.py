@@ -2,6 +2,12 @@
 import os
 import logging
 import asyncio
+import socket
+import ssl
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+from urllib.parse import urlparse
+
 import httpx
 import smtplib
 from telegram import (
@@ -18,6 +24,7 @@ from telegram.ext import (
 
 # ——— CONFIGURATION ———
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # seconds
+CERT_WARN_DAYS = int(os.environ.get("CERT_WARN_DAYS", "14"))
 
 # ——— READ HTTP DOMAINS FROM ENV ———
 # Expects a comma-separated list, e.g. "https://a.com,https://b.org"
@@ -56,6 +63,118 @@ if not mail_servers:
 # ——— STATE TRACKERS ———
 http_status = {domain: True for domain in domains_http}
 mail_status = {(host, port): True for (host, port, *_ ) in mail_servers}
+# Store certificate expiry dates (None if not checked or failed)
+http_cert_expiry = {
+    domain: None
+    for domain in domains_http
+    if urlparse(domain).scheme == "https"
+}
+mail_cert_expiry = {(host, port): None for (host, port, *_ ) in mail_servers}
+
+
+def _parse_cert_expiry(cert_dict):
+    not_after = cert_dict.get("notAfter")
+    if not_after is None:
+        raise ValueError("Certificate missing notAfter field")
+    expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+    return expiry.replace(tzinfo=timezone.utc)
+
+
+def fetch_cert_expiry(host: str, port: int):
+    context = ssl.create_default_context()
+    with socket.create_connection((host, port), timeout=10) as sock:
+        with context.wrap_socket(sock, server_hostname=host) as ssock:
+            cert = ssock.getpeercert()
+    if not cert:
+        raise ValueError("Remote certificate not provided")
+    return _parse_cert_expiry(cert)
+
+
+async def _notify_cert_status(
+    key,
+    label: str,
+    expiry_map: dict,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    expiry: Optional[datetime] = None,
+    failure_reason: Optional[str] = None,
+):
+    now = datetime.now(timezone.utc)
+    remaining = None
+    is_ok = True
+    if expiry is None:
+        is_ok = False
+    else:
+        remaining = expiry - now
+        if remaining <= timedelta(seconds=0):
+            is_ok = False
+        elif remaining <= timedelta(days=CERT_WARN_DAYS):
+            is_ok = False
+
+    prev_expiry = expiry_map.get(key)
+    # Store expiry (or None if failed)
+    expiry_map[key] = expiry
+
+    if is_ok:
+        if prev_expiry is None:
+            expiry_str = expiry.date().isoformat() if expiry else "unknown"
+            await context.bot.send_message(
+                CHAT_ID, f"🟢 TLS cert for {label} is OK (exp {expiry_str})."
+            )
+    else:
+        notify = False
+        message = ""
+        if expiry is None:
+            reason = failure_reason or "validation failed"
+            message = f"🔴 TLS cert for {label} failed validation ({reason})."
+            notify = True
+        elif remaining is not None and remaining <= timedelta(seconds=0):
+            message = (
+                f"🔴 TLS cert for {label} expired on {expiry.date().isoformat()}."
+            )
+            notify = True
+        else:
+            days_left = max(
+                0, int(remaining.total_seconds() // 86400) if remaining else 0
+            )
+            message = (
+                f"🟠 TLS cert for {label} expires in {days_left} days "
+                f"({expiry.date().isoformat()})."
+            )
+            notify = True
+
+        if prev_expiry is None and notify:
+            await context.bot.send_message(CHAT_ID, message)
+
+
+async def ensure_http_cert(domain: str, context: ContextTypes.DEFAULT_TYPE):
+    parsed = urlparse(domain)
+    if parsed.scheme != "https":
+        return
+    host = parsed.hostname
+    if not host:
+        return
+    port = parsed.port or 443
+    try:
+        expiry = await asyncio.to_thread(fetch_cert_expiry, host, port)
+    except (ssl.SSLCertVerificationError, ssl.CertificateError) as exc:
+        await _notify_cert_status(
+            domain,
+            f"HTTP {domain}",
+            http_cert_expiry,
+            context,
+            failure_reason=str(exc),
+        )
+    except Exception as exc:
+        logger.debug(f"TLS cert check failed for {domain}: {exc}")
+    else:
+        await _notify_cert_status(
+            domain,
+            f"HTTP {domain}",
+            http_cert_expiry,
+            context,
+            expiry=expiry,
+        )
 
 # ——— ENV VARS FOR TELEGRAM ———
 TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -84,12 +203,28 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Your chat ID is: `{update.effective_chat.id}`", parse_mode="Markdown"
     )
 
+def _format_cert_info(expiry: Optional[datetime]) -> str:
+    """Format certificate expiry info with days remaining."""
+    if expiry is None:
+        return "❌ no cert"
+    now = datetime.now(timezone.utc)
+    remaining = expiry - now
+    if remaining <= timedelta(seconds=0):
+        days = int(abs(remaining.total_seconds()) // 86400)
+        return f"❌ expired {days}d ago ({expiry.date().isoformat()})"
+    days_left = int(remaining.total_seconds() // 86400)
+    return f"✅ {days_left}d left (exp {expiry.date().isoformat()})"
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for domain, up in http_status.items():
         lines.append(f"HTTP {domain}: {'✅ up' if up else '❌ down'}")
     for (host, port), up in mail_status.items():
         lines.append(f"SMTP {host}:{port}: {'✅ up' if up else '❌ down'}")
+    for domain, expiry in http_cert_expiry.items():
+        lines.append(f"CERT HTTP {domain}: {_format_cert_info(expiry)}")
+    for (host, port), expiry in mail_cert_expiry.items():
+        lines.append(f"CERT SMTP {host}:{port}: {_format_cert_info(expiry)}")
     await update.message.reply_text("\n".join(lines))
 
 # ——— PERIODIC CHECKS ———
@@ -108,28 +243,59 @@ async def check_http(context: ContextTypes.DEFAULT_TYPE):
             elif not http_status[domain] and is_up:
                 await context.bot.send_message(CHAT_ID, f"🟢 HTTP {domain} is back UP.")
             http_status[domain] = is_up
+            await ensure_http_cert(domain, context)
 
 async def check_smtp(context: ContextTypes.DEFAULT_TYPE):
     for host, port, user, pw in mail_servers:
         key = (host, port)
         try:
             def smtp_probe():
+                cert_expiry = None
+                tls_context = ssl.create_default_context()
                 if port == 465:
-                    server = smtplib.SMTP_SSL(host, port, timeout=10)
+                    server = smtplib.SMTP_SSL(
+                        host, port, timeout=10, context=tls_context
+                    )
                 else:
                     server = smtplib.SMTP(host, port, timeout=10)
                     server.ehlo()
                     if port == 587:
-                        server.starttls()
+                        server.starttls(context=tls_context)
                         server.ehlo()
-                server.login(user, pw)
-                server.quit()
+                try:
+                    if isinstance(server.sock, ssl.SSLSocket):
+                        cert = server.sock.getpeercert()
+                        if cert:
+                            cert_expiry = _parse_cert_expiry(cert)
+                    server.login(user, pw)
+                finally:
+                    server.quit()
+                return cert_expiry
 
-            await asyncio.to_thread(smtp_probe)
+            cert_expiry = await asyncio.to_thread(smtp_probe)
             is_up = True
+        except (ssl.SSLCertVerificationError, ssl.CertificateError) as e:
+            logger.debug(f"SMTP cert validation failed for {host}:{port}: {e}")
+            await _notify_cert_status(
+                key,
+                f"SMTP {host}:{port}",
+                mail_cert_expiry,
+                context,
+                failure_reason=str(e),
+            )
+            is_up = False
         except Exception as e:
             logger.debug(f"SMTP check failed for {host}:{port}: {e}")
             is_up = False
+        else:
+            # Update cert expiry info (even if None, e.g., port 25 without TLS)
+            await _notify_cert_status(
+                key,
+                f"SMTP {host}:{port}",
+                mail_cert_expiry,
+                context,
+                expiry=cert_expiry,
+            )
 
         if mail_status[key] and not is_up:
             await context.bot.send_message(CHAT_ID, f"🔴 SMTP {host}:{port} is DOWN!")
@@ -148,6 +314,10 @@ async def check_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"HTTP {domain}: {'✅ up' if up else '❌ down'}")
     for (host, port), up in mail_status.items():
         lines.append(f"SMTP {host}:{port}: {'✅ up' if up else '❌ down'}")
+    for domain, expiry in http_cert_expiry.items():
+        lines.append(f"CERT HTTP {domain}: {_format_cert_info(expiry)}")
+    for (host, port), expiry in mail_cert_expiry.items():
+        lines.append(f"CERT SMTP {host}:{port}: {_format_cert_info(expiry)}")
 
     await update.callback_query.message.reply_text(
         "📋 Current status of all monitored services:\n" + "\n".join(lines)
