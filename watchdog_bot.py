@@ -70,6 +70,13 @@ http_cert_expiry = {
     if urlparse(domain).scheme == "https"
 }
 mail_cert_expiry = {(host, port): None for (host, port, *_ ) in mail_servers}
+# Track previous cert status to avoid spam (True = OK, False = not OK)
+http_cert_status_prev = {
+    domain: True
+    for domain in domains_http
+    if urlparse(domain).scheme == "https"
+}
+mail_cert_status_prev = {(host, port): True for (host, port, *_ ) in mail_servers}
 
 
 def _parse_cert_expiry(cert_dict):
@@ -90,61 +97,17 @@ def fetch_cert_expiry(host: str, port: int):
     return _parse_cert_expiry(cert)
 
 
-async def _notify_cert_status(
-    key,
-    label: str,
-    expiry_map: dict,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    expiry: Optional[datetime] = None,
-    failure_reason: Optional[str] = None,
-):
-    now = datetime.now(timezone.utc)
-    remaining = None
-    is_ok = True
+def _is_cert_ok(expiry: Optional[datetime]) -> bool:
+    """Check if certificate is OK (valid and not expiring soon)."""
     if expiry is None:
-        is_ok = False
-    else:
-        remaining = expiry - now
-        if remaining <= timedelta(seconds=0):
-            is_ok = False
-        elif remaining <= timedelta(days=CERT_WARN_DAYS):
-            is_ok = False
-
-    prev_expiry = expiry_map.get(key)
-    # Store expiry (or None if failed)
-    expiry_map[key] = expiry
-
-    if is_ok:
-        if prev_expiry is None:
-            expiry_str = expiry.date().isoformat() if expiry else "unknown"
-            await context.bot.send_message(
-                CHAT_ID, f"🟢 TLS cert for {label} is OK (exp {expiry_str})."
-            )
-    else:
-        notify = False
-        message = ""
-        if expiry is None:
-            reason = failure_reason or "validation failed"
-            message = f"🔴 TLS cert for {label} failed validation ({reason})."
-            notify = True
-        elif remaining is not None and remaining <= timedelta(seconds=0):
-            message = (
-                f"🔴 TLS cert for {label} expired on {expiry.date().isoformat()}."
-            )
-            notify = True
-        else:
-            days_left = max(
-                0, int(remaining.total_seconds() // 86400) if remaining else 0
-            )
-            message = (
-                f"🟠 TLS cert for {label} expires in {days_left} days "
-                f"({expiry.date().isoformat()})."
-            )
-            notify = True
-
-        if prev_expiry is None and notify:
-            await context.bot.send_message(CHAT_ID, message)
+        return False
+    now = datetime.now(timezone.utc)
+    remaining = expiry - now
+    if remaining <= timedelta(seconds=0):
+        return False
+    if remaining <= timedelta(days=CERT_WARN_DAYS):
+        return False
+    return True
 
 
 async def ensure_http_cert(domain: str, context: ContextTypes.DEFAULT_TYPE):
@@ -155,26 +118,50 @@ async def ensure_http_cert(domain: str, context: ContextTypes.DEFAULT_TYPE):
     if not host:
         return
     port = parsed.port or 443
+    
+    expiry = None
+    failure_reason = None
     try:
         expiry = await asyncio.to_thread(fetch_cert_expiry, host, port)
     except (ssl.SSLCertVerificationError, ssl.CertificateError) as exc:
-        await _notify_cert_status(
-            domain,
-            f"HTTP {domain}",
-            http_cert_expiry,
-            context,
-            failure_reason=str(exc),
-        )
+        failure_reason = str(exc)
+        logger.debug(f"TLS cert check failed for {domain}: {exc}")
     except Exception as exc:
         logger.debug(f"TLS cert check failed for {domain}: {exc}")
-    else:
-        await _notify_cert_status(
-            domain,
-            f"HTTP {domain}",
-            http_cert_expiry,
-            context,
-            expiry=expiry,
+    
+    # Store expiry (or None if failed)
+    http_cert_expiry[domain] = expiry
+    
+    # Check status
+    is_ok = _is_cert_ok(expiry)
+    prev_ok = http_cert_status_prev.get(domain, True)
+    
+    # Notify on status change
+    if prev_ok and not is_ok:
+        if expiry is None:
+            reason = failure_reason or "validation failed"
+            await context.bot.send_message(
+                CHAT_ID, f"🔴 TLS cert for HTTP {domain} failed validation ({reason})."
+            )
+        else:
+            now = datetime.now(timezone.utc)
+            remaining = expiry - now
+            if remaining <= timedelta(seconds=0):
+                await context.bot.send_message(
+                    CHAT_ID, f"🔴 TLS cert for HTTP {domain} expired on {expiry.date().isoformat()}."
+                )
+            else:
+                days_left = int(remaining.total_seconds() // 86400)
+                await context.bot.send_message(
+                    CHAT_ID, f"🟠 TLS cert for HTTP {domain} expires in {days_left} days ({expiry.date().isoformat()})."
+                )
+    elif not prev_ok and is_ok:
+        expiry_str = expiry.date().isoformat() if expiry else "unknown"
+        await context.bot.send_message(
+            CHAT_ID, f"🟢 TLS cert for HTTP {domain} is OK (exp {expiry_str})."
         )
+    
+    http_cert_status_prev[domain] = is_ok
 
 # ——— ENV VARS FOR TELEGRAM ———
 TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -248,6 +235,8 @@ async def check_http(context: ContextTypes.DEFAULT_TYPE):
 async def check_smtp(context: ContextTypes.DEFAULT_TYPE):
     for host, port, user, pw in mail_servers:
         key = (host, port)
+        cert_expiry = None
+        failure_reason = None
         try:
             def smtp_probe():
                 cert_expiry = None
@@ -276,26 +265,45 @@ async def check_smtp(context: ContextTypes.DEFAULT_TYPE):
             is_up = True
         except (ssl.SSLCertVerificationError, ssl.CertificateError) as e:
             logger.debug(f"SMTP cert validation failed for {host}:{port}: {e}")
-            await _notify_cert_status(
-                key,
-                f"SMTP {host}:{port}",
-                mail_cert_expiry,
-                context,
-                failure_reason=str(e),
-            )
+            failure_reason = str(e)
             is_up = False
         except Exception as e:
             logger.debug(f"SMTP check failed for {host}:{port}: {e}")
             is_up = False
-        else:
-            # Update cert expiry info (even if None, e.g., port 25 without TLS)
-            await _notify_cert_status(
-                key,
-                f"SMTP {host}:{port}",
-                mail_cert_expiry,
-                context,
-                expiry=cert_expiry,
+
+        # Store cert expiry (even if None, e.g., port 25 without TLS)
+        mail_cert_expiry[key] = cert_expiry
+        
+        # Check cert status
+        is_cert_ok = _is_cert_ok(cert_expiry)
+        prev_cert_ok = mail_cert_status_prev.get(key, True)
+        
+        # Notify on cert status change
+        if prev_cert_ok and not is_cert_ok:
+            if cert_expiry is None:
+                reason = failure_reason or "validation failed"
+                await context.bot.send_message(
+                    CHAT_ID, f"🔴 TLS cert for SMTP {host}:{port} failed validation ({reason})."
+                )
+            else:
+                now = datetime.now(timezone.utc)
+                remaining = cert_expiry - now
+                if remaining <= timedelta(seconds=0):
+                    await context.bot.send_message(
+                        CHAT_ID, f"🔴 TLS cert for SMTP {host}:{port} expired on {cert_expiry.date().isoformat()}."
+                    )
+                else:
+                    days_left = int(remaining.total_seconds() // 86400)
+                    await context.bot.send_message(
+                        CHAT_ID, f"🟠 TLS cert for SMTP {host}:{port} expires in {days_left} days ({cert_expiry.date().isoformat()})."
+                    )
+        elif not prev_cert_ok and is_cert_ok:
+            expiry_str = cert_expiry.date().isoformat() if cert_expiry else "unknown"
+            await context.bot.send_message(
+                CHAT_ID, f"🟢 TLS cert for SMTP {host}:{port} is OK (exp {expiry_str})."
             )
+        
+        mail_cert_status_prev[key] = is_cert_ok
 
         if mail_status[key] and not is_up:
             await context.bot.send_message(CHAT_ID, f"🔴 SMTP {host}:{port} is DOWN!")
